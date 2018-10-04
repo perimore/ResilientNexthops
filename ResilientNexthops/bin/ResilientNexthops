@@ -73,10 +73,10 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
       # Create a nexthop group object
       nexthopGroup = eossdk.NexthopGroup("NH1", eossdk.NEXTHOP_GROUP_IP)
 
-      for entry, ip, active in NexthopList:
+      for idx, entry in enumerate(NexthopList):
          # Create a neighbour key using the nexthop IP
          neighbor_key = eossdk.NeighborKey(
-            self.get_ip_addr(ip), eossdk.IntfId())
+            self.get_ip_addr(entry[1]), eossdk.IntfId())
          # Try and find the neighbour entry using the neighbour key
          neighbor_entry = self.neighborMgr_.neighbor_entry_status(neighbor_key)
          # If an entry is found, get the actual entry
@@ -84,10 +84,10 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
             neighbor_entry = self.neighborMgr_.neighbor_entry(neighbor_key)
          # If no entry is returned, it must not be active
          if neighbor_entry == eossdk.NeighborEntry():
-            NexthopList[entry][2] = False
+            NexthopList[idx][2] = False
          # Else it is is active, set the active flag
          else:
-            NexthopList[entry][2] = True
+            NexthopList[idx][2] = True
 
       self.tracer.trace3("Nexthop entries: " + str(NexthopList))
 

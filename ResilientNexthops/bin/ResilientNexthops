@@ -1,6 +1,21 @@
 #!/usr/bin/env python
 # Copyright (c) 2018 Arista Networks, Inc.  All rights reserved.
 # Arista Networks, Inc. Confidential and Proprietary.
+#
+# The ResilientNexthops application keeps the total number of nexthops the same by 
+# replacing the deleted entry with one or more of the active entries to maintain the 
+# order of entries in the nexthop-group.
+# 
+# The configuration to achieve resilient nexthop behaviour is shown below:
+#
+# daemon ResilientNexthops
+#    exec /mnt/flash/ResilientNexthops
+#    option 0 value <Nexthop via FW1>
+#    option 1 value <Nexthop via FW2>
+#    option 2 value <Nexthop via FW3>
+#    option GROUP_NAME value NextHopGroup1
+#    no shutdown
+#
 
 import eossdk
 import sys
@@ -11,6 +26,7 @@ import itertools
 from operator import itemgetter
 
 NexthopList = []
+NexthopGroupName = "NH1"
 
 class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler ):
    def __init__( self, neighborMgr, nexthopGroupMgr, agentMgr ):
@@ -19,8 +35,8 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
          # pylint: disable-msg=W0233
       eossdk.NeighborTableHandler.__init__( self, neighborMgr )
          # pylint: disable-msg=W0233
-      self.tracer = eossdk.Tracer("ResilientNexthopAgent")
-      self.agentMgr = agentMgr
+      self.tracer = eossdk.Tracer("ResilientNexthopsAgent")
+      self.agentMgr_ = agentMgr
       self.neighborMgr_ = neighborMgr
       self.nexthopGroupMgr_ = nexthopGroupMgr
       syslog.syslog("Constructed")
@@ -30,38 +46,78 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
    def on_initialized( self ):
       # Called when the agent is initialised to set the status
       lastChangeTime = re.sub( ' +', ' ', time.ctime() )
-      self.agentMgr.status_set("Agent Status:", "Administratively Up (Since: "
-         +str(lastChangeTime)+")")
+      self.agentMgr_.status_set("Agent Status:", "Administratively Up (Since: %s)" 
+         % str(lastChangeTime))
       self.watch_all_neighbor_entries( True )  # pylint: disable-msg=E1101
       self.tracer.trace0("We are initialized!" )
       syslog.syslog( "We are initialized!" )
       self.BuildNexthopList()
 
    def on_agent_option( self, option, value ):
-      self.tracer.trace0("Nexthop configuration changed: (" + str(option) + "," 
-         + (str(value) if str(value) != "" else "Removed") + ")")  
+      global NexthopGroupName
+      self.agentMgr_.status_del("Config Error:")
+      self.agentMgr_.status_del("Nexthop%s:" % option)
+      if str(option) == "GROUP_NAME" :
+         if self.nexthopGroupMgr_.exists(NexthopGroupName):
+            self.nexthopGroupMgr_.nexthop_group_del(NexthopGroupName)
+         if value == "":
+            NexthopGroupName = "NH1"
+
+      #Report the config change
+      status = "Nexthop configuration changed: %s = " % str(option)
+      if value == "":
+         status += "Removed"
+      else:
+         status += str(value)
+      self.tracer.trace0( status )
+      
       self.BuildNexthopList()
       
    def BuildNexthopList(self):
-      # Create a list of the daemon options containing the nexthops to load balance
-      # across
+      # Create a list of nexthops to load balance across
       global NexthopList
+      global NexthopGroupName
       NexthopList = []
-      for nhEntry in self.agentMgr.agent_option_iter():
-         # [ Entry Number, IP Address, Active ]
-         NexthopList.append( [int(nhEntry), self.agentMgr.agent_option(nhEntry),
-            False] )
+      # Get the configuration options
+      for nhEntry in self.agentMgr_.agent_option_iter():
+         # If the option is a number, this must be a next-hop
+         if nhEntry.isdigit():
+            # Get an IP object back. self.get_ip_addr also checks this is a valid IP
+            ip = self.get_ip_addr( self.agentMgr_.agent_option(nhEntry) )
+            # IPv6 is not yet supported. Contact Arista for more information.
+            if ip.af() == 4 :
+               # [ Entry Number, IP Address, Active ]
+               NexthopList.append( [int(nhEntry), ip, False] )
+            else:
+               self.agentMgr_.status_set( "Config Error:" , 
+                  "Invalid address type. Only IPv4 is supported today.")
+         # Non-default Nexthop-group name
+         elif nhEntry == "GROUP_NAME":
+            NexthopGroupName = self.agentMgr_.agent_option("GROUP_NAME")
+         # Else this an invalid config option.
+         else:   
+            self.agentMgr_.status_set( "Config Error:" , 
+               "Invalid config option (\"%s\"). \
+               Use only integers to define a nexthop entry" % str(nhEntry))
 
-      # If we have any configured nexthops, continue.
+      self.agentMgr_.status_set("Nexthop-Group Name:", NexthopGroupName)
+
+      # If we have any valid configured nexthops, continue.
       if len( NexthopList ) > 0:
-         self.tracer.trace3( "Current order of nexthops: " + str(NexthopList))
+         self.tracer.trace3( "Initial order of nexthops: " + 
+            str(list(map(lambda x: x[1].to_string(), NexthopList))))
+         # Python reads the config options in a random order. 
+         # This sorts them in the correct order.
          NexthopList.sort(key=itemgetter(0))
-         self.tracer.trace3( "Sorted order of nexthops: " + str(NexthopList) )
+         self.tracer.trace3( "Sorted order of nexthops: " + 
+            str(list(map(lambda x: x[1].to_string(), NexthopList))))
          # Setup the nexthop group
+         self.agentMgr_.status_set("Config Status:" , "%s valid nexthops defined" % 
+            len( NexthopList ))
          self.BuildNexthopGroup()
       else:
-         syslog.syslog( "Nexthops not defined. Check config." )
-         self.tracer.trace0( "Nexthops not defined. Check config." )
+         self.agentMgr_.status_set( "Config Status:" , "No nexthops are defined" )
+         self.agentMgr_.status_del( "Hardware Entries:" )
 
    def BuildNexthopGroup(self):
       global NexthopList
@@ -71,26 +127,38 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
       possibleNexthops = range(len(NexthopList), 0, -1)
       numNexthops = self.lcmm(*possibleNexthops)
       # Create a nexthop group object
-      nexthopGroup = eossdk.NexthopGroup("NH1", eossdk.NEXTHOP_GROUP_IP)
+      nexthopGroup = eossdk.NexthopGroup( NexthopGroupName, eossdk.NEXTHOP_GROUP_IP)
 
+      # Work out if we have an active ARP entry
       for idx, entry in enumerate(NexthopList):
          # Create a neighbour key using the nexthop IP
-         neighbor_key = eossdk.NeighborKey(
-            self.get_ip_addr(entry[1]), eossdk.IntfId())
+         neighbor_key = eossdk.NeighborKey( entry[1] )
          # Try and find the neighbour entry using the neighbour key
          neighbor_entry = self.neighborMgr_.neighbor_entry_status(neighbor_key)
          # If an entry is found, get the actual entry
          if neighbor_entry == eossdk.NeighborEntry():
             neighbor_entry = self.neighborMgr_.neighbor_entry(neighbor_key)
-         # If no entry is returned, it must not be active
+         # If no entry is returned, it is not active
          if neighbor_entry == eossdk.NeighborEntry():
             NexthopList[idx][2] = False
          # Else it is is active, set the active flag
          else:
             NexthopList[idx][2] = True
+         self.tracer.trace3("Nexthop entry: %s - Up: %s" % 
+            (entry[1].to_string(), entry[2]))
 
-      self.tracer.trace3("Nexthop entries: " + str(NexthopList))
+      # Set the status of the nexthops in the daemon output
+      for option in NexthopList:
+         if option[2]:
+            status = "%s Up" % option[1].to_string()
+         else:
+            status = "%s Down" % option[1].to_string()
+         self.agentMgr_.status_set("Nexthop%s:" % option[0], status)
+      
+      self.BuildNextHopGroupEntries(numNexthops, nexthopGroup)
 
+   def BuildNextHopGroupEntries(self, numNexthops, nexthopGroup):
+      self.agentMgr_.status_set("Hardware Entries:", str(numNexthops) )
       # Build the successful Nexthops
       x = 0
       # Create a list of active and failed nexthops
@@ -100,41 +168,47 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
       for i in range(numNexthops):
          # If the entry is active, set the ip as an eossdk.IpAddr object
          if NexthopList[i-x][2]:
-            ip = self.get_ip_addr(NexthopList[i-x][1])
-            # If we got an IpAddr object back, create a nexthop entry
-            if ip is not None:
-               nexthopGroup.nexthop_set(i, eossdk.NexthopGroupEntry(ip))
-               # Add the IP address to the active nexthops
-               activeNexthops.append(NexthopList[i-x][1])
+            ip = NexthopList[i-x][1]
+            nexthopGroup.nexthop_set(i, eossdk.NexthopGroupEntry(ip))
+            # Add the IP address to the active nexthops
+            activeNexthops.append(ip)
          else:
             # Add the failed nexthop entry number to a new array.
             # We will cycle this later
             failedNexthops.append(i)
          # Increment x if we have reached the end of the configured nexthops but
          # we have expanded to the LCM
-         if i==((len(NexthopList)-1) + x) : x += len(NexthopList)
+         if i==((len(NexthopList)-1) + x): 
+            x += len(NexthopList)
 
-      self.tracer.trace3("Failed nexthops: " + str(failedNexthops)) if \
-         len(failedNexthops) > 0 else self.tracer.trace3("Failed nexthops: None")
-      self.tracer.trace3("Active nexthops: " + str(activeNexthops)) if \
-         len(activeNexthops) > 0 else self.tracer.trace3("Active nexthops: None")
+      # Report the status of the nexthops
+      if len(failedNexthops) > 0:
+         self.tracer.trace3("Failed nexthops: " + str(failedNexthops))
+      else:
+         self.tracer.trace3("Failed nexthops: None")
+      
+      if len(activeNexthops) > 0:
+         self.tracer.trace3("Active nexthops: " + 
+            str(list(map(lambda x: x.to_string(), activeNexthops))))
+      else:
+         self.tracer.trace3("Active nexthops: None")
+
       # If there are failed entries, fill in the gaps if we have active nexthops
       if len(failedNexthops) > 0 and len(activeNexthops) > 0:
          # Allow the active nexthops to be iterated cyclicly
-         nexthopEntry = itertools.cycle(activeNexthops)
+         activeNexthopsCycle = itertools.cycle(activeNexthops)
          # For each failed entry, fill in with the next active entry
          for entry in failedNexthops:
-            activeNexthop = next(nexthopEntry)
-            ip = self.get_ip_addr(activeNexthop)
-            nexthopGroup.nexthop_set(entry, eossdk.NexthopGroupEntry(ip))
-
+            activeNexthopFiller = next(activeNexthopsCycle)
+            nexthopGroup.nexthop_set(entry, 
+               eossdk.NexthopGroupEntry(activeNexthopFiller))
+      
       # If there are active nexthops, create the nexthop-group. Otherwise, remove it.
-      # This allows the static route pointing to the nexthop-group to become
-      # inactive.
+      # This allows the static route pointing to the nexthop-group to become inactive
       if len(activeNexthops) > 0:
          self.nexthopGroupMgr_.nexthop_group_set(nexthopGroup)
-      elif self.nexthopGroupMgr_.exists('NH1'):
-         self.nexthopGroupMgr_.nexthop_group_del('NH1')
+      elif self.nexthopGroupMgr_.exists(NexthopGroupName):
+         self.nexthopGroupMgr_.nexthop_group_del(NexthopGroupName)
 
    def get_ip_addr(self, ip_addr):
       try:
@@ -142,29 +216,21 @@ class ResilientNexthopHandler( eossdk.AgentHandler, eossdk.NeighborTableHandler 
       except eossdk.Error as e:
          sys.stderr.write('Invalid IP address: %s (%s)' % (ip_addr, e))
 
-   # Callback provided by NeighbourHandler when an ARP entry appears
+   # Callback provided by NeighbourHandler when an ARP entry changes
    def on_neighbor_entry_set( self, neighborEntry ):
-      entry = neighborEntry
-      entryIp = entry.neighbor_key().ip_addr().to_string()
-      update = False
-      nexthopGroup = self.nexthopGroupMgr_.nexthop_group("NH1")
-      for i in NexthopList:
-         if i[1] == entryIp:
-            update = True
-      if update:
-         self.BuildNexthopGroup()
+      entryIp = neighborEntry.neighbor_key().ip_addr()
+      self.checkForEntry(entryIp)
 
    # Callback provided by NeighbourHandler when an ARP entry is deleted
    def on_neighbor_entry_del( self, neighborKey ):
-      entry = neighborKey
-      entryIp = entry.ip_addr().to_string()
-      update = False
-      nexthopGroup = self.nexthopGroupMgr_.nexthop_group("NH1")
+      entryIp = neighborKey.ip_addr()
+      self.checkForEntry(entryIp)
+        
+   def checkForEntry(self, entryIp):
       for i in NexthopList:
          if i[1] == entryIp:
-            update = True
-      if update:
-         self.BuildNexthopGroup()
+            self.BuildNexthopGroup()
+            break
         
    # Calculate the Lowest Common Multiplier
    def lcm(self, x,y):
